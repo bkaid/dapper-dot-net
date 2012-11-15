@@ -9,6 +9,142 @@ namespace Dapper
 {
     public static partial class SqlMapper
     {
+        partial class GridReader
+        {
+            public async Task<IList<T>> ReadListAsync<T>()
+            {
+                return await Task.Run(
+                    async
+                    () =>
+                        {
+                            if (reader == null)
+                                throw new ObjectDisposedException(
+                                    GetType().FullName,
+                                    "The reader has been disposed; this can happen after all data has been consumed"
+                                    );
+                            if (consumed)
+                                throw new InvalidOperationException("Each grid can only be iterated once");
+
+                            var index = gridIndex;
+                            try
+                            {
+
+                                var typedIdentity = identity.ForGrid(typeof (T), gridIndex);
+                                var cache = GetCacheInfo(typedIdentity);
+                                var deserializer = cache.Deserializer;
+
+                                var hash = GetColumnHash(reader);
+                                if (deserializer.Func == null || deserializer.Hash != hash)
+                                {
+                                    deserializer = new DeserializerState(hash,
+                                                                        GetDeserializer(typeof (T), reader, 0,
+                                                                                        -1, false));
+                                    cache.Deserializer = deserializer;
+                                }
+                                consumed = true;
+
+                                IList<T> result = new List<T>();
+                                var dbDataReader = (DbDataReader) reader;
+                                while (index == gridIndex && await dbDataReader.ReadAsync())
+                                {
+                                    result.Add(
+                                        (T) deserializer.Func(reader)
+                                        );
+                                }
+                                return result;
+                            }
+                            finally // finally so that First etc progresses things even when multiple rows
+                            {
+                                if (index == gridIndex)
+                                {
+                                    NextResult();
+                                }
+                            }
+                        }
+                                );
+            }
+        }
+
+            /// <summary>
+            /// Query Async Multiple
+            /// </summary>
+            /// <param name="cnn"></param>
+            /// <param name="sql"></param>
+            /// <param name="param"></param>
+            /// <param name="transaction"></param>
+            /// <param name="commandTimeout"></param>
+            /// <param name="commandType"></param>
+            /// <returns></returns>
+            public static async Task<GridReader> QueryMultipleAsync(
+                this IDbConnection cnn,
+                string sql,
+                dynamic param = null,
+                IDbTransaction transaction = null,
+                int? commandTimeout = null,
+                CommandType? commandType = null
+                )
+            {
+                var identity = new Identity(
+                    sql,
+                    commandType,
+                    cnn,
+                    typeof (GridReader),
+                    (object) param == null
+                        ? null
+                        : ((object) param).GetType(),
+                    null
+                    );
+                var info = GetCacheInfo(identity);
+
+                DbCommand cmd = null;
+                DbDataReader reader = null;
+                var wasClosed = cnn.State == ConnectionState.Closed;
+                var commandBehavior = wasClosed
+                                          ? CommandBehavior.CloseConnection
+                                          : CommandBehavior.Default;
+                try
+                {
+                    if (wasClosed) cnn.Open();
+                    cmd = (DbCommand)
+                          SetupCommand(
+                              cnn,
+                              transaction,
+                              sql,
+                              info.ParamReader,
+                              param,
+                              commandTimeout,
+                              commandType
+                              );
+                    
+                    reader = await cmd.ExecuteReaderAsync(commandBehavior);
+
+                    var result = new GridReader(cmd, reader, identity);
+                    wasClosed = false; // *if* the connection was closed and we got this far, then we now have a reader
+                    // with the CloseConnection flag, so the reader will deal with the connection; we
+                    // still need something in the "finally" to ensure that broken SQL still results
+                    // in the connection closing itself
+                    return result;
+                }
+                catch
+                {
+                    if (reader != null)
+                    {
+                        if (!reader.IsClosed)
+                            try
+                            {
+                                cmd.Cancel();
+                            }
+                            catch
+                            {
+                                /* don't spol the existing exception */
+                            }
+                        reader.Dispose();
+                    }
+                    if (cmd != null) cmd.Dispose();
+                    if (wasClosed) cnn.Close();
+                    throw;
+                }
+            }
         /// <summary>
         /// Execute a query asynchronously using .NET 4.5 Task.
         /// </summary>
